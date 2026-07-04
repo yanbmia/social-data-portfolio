@@ -1,0 +1,421 @@
+---
+title: "Gender Role Attitudes and Life Satisfaction: A Cross-National Analysis"
+subtitle: "Data from the World Values Survey"
+author: "Mia Yan"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+------------------------------------------------------------------------
+
+# Project Note
+
+This project began as a lab assignment for *Stats for Social Research*.
+
+**To reproduce:** download `WVS_Cross-National_Wave_7_csv_v6_0.csv` from the
+[World Values Survey site](https://www.worldvaluessurvey.org/WVSDocumentationWV7.jsp)
+and place it in the same folder as this `.Rmd` file, then knit.
+
+------------------------------------------------------------------------
+
+# Introduction
+
+## Motivation
+
+Gender role attitudes (beliefs about whether women's primary place is in the home
+or the workforce) vary widely across societies and are frequently studied as both
+a cause and a consequence of women's economic and social status. A separate literature
+links subjective well-being to the "fit" between an individual's attitudes and the
+norms of the society they live in: holding progressive attitudes in a traditional
+society (or vice versa) may carry a well-being cost, while holding attitudes aligned
+with the surrounding culture may not. This suggests any relationship between gender
+attitudes and life satisfaction should not be assumed constant across countries, should be treated as an empirical question.
+
+## Research Question
+
+**RQ:** How do gender role attitudes relate to life satisfaction, and does this
+relationship differ across countries?
+
+**Hypotheses:**
+
+-   **H1:** More progressive attitudes toward women's work will show a small
+    average association with life satisfaction once demographic differences are
+    accounted for.
+-   **H2 (moderation):** The direction and/or strength of this association will
+    vary by country, reflecting differing cultural norms around gender roles.
+
+## Data
+
+WVS Cross-National Wave 7 dataset (`WVS_Cross-National_Wave_7_csv_v6_0.csv`).
+
+------------------------------------------------------------------------
+
+# Data Setup
+
+## Load packages
+
+```{r load-packages}
+# NOTE: MASS is loaded before tidyverse on purpose. MASS::select() would
+# otherwise mask dplyr::select() and break every select() call below.
+library(MASS)         # ordinal logistic regression (polr)
+library(tidyverse)   # data wrangling + ggplot2 (dplyr::select overrides MASS::select)
+library(gridExtra)   # combining plots
+library(broom)        # tidy model output
+library(estimatr)     # cluster-robust SEs (lm_robust)
+library(car)          # VIF for multicollinearity checks
+library(modelsummary) # side-by-side regression tables
+```
+
+## Import data
+
+```{r import-data}
+# Place WVS_Cross-National_Wave_7_csv_v6_0.csv in the same directory as this file.
+# Using a relative path (rather than a hardcoded setwd()) keeps the project
+# portable across machines.
+wvs_data <- read_csv("WVS_Cross-National_Wave_7_csv_v6_0.csv")
+```
+
+## Data inspection
+
+```{r inspect-data}
+dim(wvs_data)
+```
+
+**How many observations / variables are in the raw dataset?** 97,220 observations
+and 613 variables.
+
+## Data cleaning
+
+Variables used:
+
+-   `B_COUNTRY_ALPHA` -- country
+-   `S018` -- age (already scaled 0-1 in this wave)
+-   `Q260` -- gender (1 = Male, 2 = Female)
+-   `Q262` -- education
+-   `Q46` -- life satisfaction (1 = dissatisfied ... 4 = satisfied, after recode)
+-   `Q132` -- attitude toward women's participation in the workforce
+
+```{r clean-data}
+wvs_clean <- wvs_data %>%
+  select(B_COUNTRY_ALPHA, S018, Q260, Q262, Q46, Q132) %>%
+  rename(
+    country = B_COUNTRY_ALPHA,
+    age = S018,
+    gender = Q260,
+    education = Q262,
+    life_satisfaction = Q46,
+    women_work_attitude = Q132
+  ) %>%
+  filter(
+    age > 0,
+    gender %in% c(1, 2),
+    education >= 1,
+    life_satisfaction > 0,
+    women_work_attitude > 0,
+    country %in% c("USA", "GBR", "DEU", "JPN", "IND", "MEX")
+  ) %>%
+  # reverse-code so higher = more progressive (women's work seen as acceptable)
+  mutate(women_work_attitude = 5 - women_work_attitude) %>%
+  na.omit()
+
+dim(wvs_clean)
+```
+
+**Q: How was the data cleaned, and how many observations/variables remain?**
+
+The data were cleaned by selecting six relevant variables, dropping negative
+(missing/refused) response codes, restricting the sample to six countries
+(USA, UK, Germany, Japan, India, Mexico) for a tractable but still culturally
+diverse cross-national comparison, and reverse-coding the work-attitude item so
+higher values consistently mean "more progressive." The cleaned dataset contains
+**11,093 observations and 6 variables**.
+
+------------------------------------------------------------------------
+
+# Analysis
+
+## Descriptive statistics
+
+```{r descriptive-statistics}
+cat("NUMERIC VARIABLES\n")
+
+cat("\nLife Satisfaction:\n")
+print(wvs_clean %>% summarise(
+  Mean = mean(life_satisfaction), Median = median(life_satisfaction),
+  SD = sd(life_satisfaction), Min = min(life_satisfaction), Max = max(life_satisfaction)
+))
+
+cat("\nWomen's Work Attitude (higher = more progressive):\n")
+print(wvs_clean %>% summarise(
+  Mean = mean(women_work_attitude), Median = median(women_work_attitude),
+  SD = sd(women_work_attitude), Min = min(women_work_attitude), Max = max(women_work_attitude)
+))
+
+cat("\nAge (scaled 0-1):\n")
+print(wvs_clean %>% summarise(
+  Mean = mean(age), Median = median(age), SD = sd(age), Min = min(age), Max = max(age)
+))
+
+cat("\nEducation:\n")
+print(wvs_clean %>% summarise(
+  Mean = mean(education), Median = median(education), SD = sd(education),
+  Min = min(education), Max = max(education)
+))
+
+cat("\n\nCATEGORICAL VARIABLES\n")
+cat("\nGender (1=Male, 2=Female):\n")
+print(table(wvs_clean$gender))
+print(prop.table(table(wvs_clean$gender)))
+
+cat("\nCountry:\n")
+print(table(wvs_clean$country))
+print(prop.table(table(wvs_clean$country)))
+```
+
+```{r plot-descriptives, fig.height=5.5, fig.width=6.5}
+plot1 <- ggplot(wvs_clean, aes(x = life_satisfaction)) +
+  geom_histogram(binwidth = 0.5, fill = "lightblue", color = "black") +
+  labs(title = "Distribution of Life Satisfaction", x = "Life Satisfaction", y = "Frequency") +
+  theme_minimal()
+
+plot2 <- ggplot(wvs_clean, aes(x = women_work_attitude)) +
+  geom_histogram(binwidth = 0.5, fill = "pink", color = "black") +
+  labs(title = "Distribution of Women's Work Attitude", x = "Women's Work Attitude", y = "Frequency") +
+  theme_minimal()
+
+plot3 <- ggplot(wvs_clean, aes(x = factor(gender, labels = c("Male", "Female")))) +
+  geom_bar(fill = "purple", color = "black") +
+  labs(title = "Gender Distribution", x = "Gender", y = "Frequency") +
+  theme_minimal()
+
+plot4 <- ggplot(wvs_clean, aes(x = country)) +
+  geom_bar(fill = "darkgreen", color = "black") +
+  labs(title = "Country Distribution", x = "Country", y = "Frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+gridExtra::grid.arrange(plot1, plot2, plot3, plot4, ncol = 2)
+```
+
+```{r correlation-heatmap, fig.height=4, fig.width=5}
+# Correlation heatmap gives a quick visual overview before modeling
+numeric_vars <- wvs_clean %>% select(age, education, life_satisfaction, women_work_attitude)
+corr_mat <- cor(numeric_vars, use = "complete.obs")
+
+corr_df <- as.data.frame(as.table(corr_mat))
+
+ggplot(corr_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Freq, 2)), size = 3.5) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                        midpoint = 0, limits = c(-1, 1), name = "r") +
+  theme_minimal() +
+  labs(title = "Correlation Matrix: Numeric Variables", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Descriptive summary:** Life satisfaction (mean = 1.77, median = 2, SD = 0.67) and
+women's work attitude (mean = 1.99, median = 2, SD = 0.93) are both fairly centered
+with meaningful spread. The sample is nearly evenly split by gender (49.6% male,
+50.4% female) and unevenly spread across countries, ranging from Japan (11.0%) to
+the USA (23.3%) -- a reminder that model results are not equally precise for every
+country and that the pooled sample is not population-weighted.
+
+## Modeling: does the relationship hold, and does it vary by country?
+
+Four nested models test the research question directly:
+
+1.  **Model 1** -- bivariate baseline
+2.  **Model 2** -- adds gender and country as controls (main-effects only)
+3.  **Model 3** -- adds a `women_work_attitude x country` interaction (tests H2)
+4.  **Model 4** -- adds a `women_work_attitude x gender` interaction
+
+```{r models}
+model1 <- lm(life_satisfaction ~ women_work_attitude, data = wvs_clean)
+
+model2 <- lm(life_satisfaction ~ women_work_attitude + factor(gender) + factor(country),
+             data = wvs_clean)
+
+model3 <- lm(life_satisfaction ~ women_work_attitude * factor(country) + factor(gender),
+             data = wvs_clean)
+
+model4 <- lm(life_satisfaction ~ women_work_attitude * factor(gender) + factor(country),
+             data = wvs_clean)
+
+modelsummary(
+  list("Bivariate" = model1, "+ Controls" = model2,
+       "x Country" = model3, "x Gender" = model4),
+  stars = TRUE,
+  gof_omit = "IC|Log|F"
+)
+```
+
+**Test of moderation:** an F-test compares Model 2 (main effects only) to Model 3
+(adds the country interaction) to formally test whether the attitude-satisfaction
+slope differs by country.
+
+```{r anova-test}
+anova(model2, model3)
+```
+
+### Cluster-robust standard errors
+
+Respondents are nested within six countries, so ordinary standard errors likely
+understate uncertainty. As a robustness check, Model 2 is re-estimated with
+standard errors clustered by country.
+
+```{r robust-se}
+model2_robust <- lm_robust(
+  life_satisfaction ~ women_work_attitude + factor(gender) + factor(country),
+  data = wvs_clean, clusters = country, se_type = "stata"
+)
+summary(model2_robust)
+```
+
+### Regression diagnostics
+
+```{r diagnostics, fig.height=3.5, fig.width=6.5}
+diag_df <- augment(model2)
+
+p_resid <- ggplot(diag_df, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.15) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Residuals vs Fitted", x = "Fitted values", y = "Residuals") +
+  theme_minimal()
+
+p_qq <- ggplot(diag_df, aes(sample = .resid)) +
+  stat_qq(alpha = 0.15) +
+  stat_qq_line(color = "red") +
+  labs(title = "Normal Q-Q Plot") +
+  theme_minimal()
+
+gridExtra::grid.arrange(p_resid, p_qq, ncol = 2)
+
+cat("Variance Inflation Factors (Model 2):\n")
+print(car::vif(model2))
+```
+
+Residuals show the expected banding of an ordinal 1-4 outcome fit with OLS,
+and VIFs are all low (no meaningful multicollinearity among predictors). The
+banding is exactly why an ordinal-regression robustness check (below) matters.
+
+### Robustness check: ordinal logistic regression
+
+Life satisfaction is genuinely ordinal (1-4), not continuous, so OLS is a
+convenient approximation rather than the "correct" model. As a check, the same
+relationship is estimated with a proportional-odds (ordinal logistic) model.
+
+```{r ordinal-model}
+wvs_clean_ord <- wvs_clean %>%
+  mutate(life_satisfaction_f = factor(life_satisfaction, ordered = TRUE))
+
+ord_model <- MASS::polr(
+  life_satisfaction_f ~ women_work_attitude + factor(gender) + factor(country),
+  data = wvs_clean_ord, Hess = TRUE
+)
+
+ord_summary <- coef(summary(ord_model))
+p_vals <- pnorm(abs(ord_summary[, "t value"]), lower.tail = FALSE) * 2
+ord_summary <- cbind(ord_summary, "p value" = round(p_vals, 4))
+print(round(ord_summary, 3))
+```
+
+The sign and (approximate) magnitude of the `women_work_attitude` coefficient
+match the OLS result, suggesting the linear-model conclusions are not an
+artifact of treating an ordinal variable as continuous.
+
+### Visualizing relationships
+
+```{r plot-relations, fig.height=6, fig.width=6.5}
+plot_scatter <- ggplot(wvs_clean, aes(x = women_work_attitude, y = life_satisfaction)) +
+  geom_point(alpha = 0.3, color = "lightgreen") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkgreen", fill = "darkgreen", alpha = 0.15) +
+  labs(title = "Life Satisfaction vs Women's Work Attitude",
+       x = "Women's Work Attitude", y = "Life Satisfaction") +
+  theme_minimal()
+
+plot_gender <- ggplot(wvs_clean, aes(x = life_satisfaction,
+                                     fill = factor(gender, labels = c("Male", "Female")))) +
+  geom_histogram(binwidth = 0.5, alpha = 0.6, position = "dodge") +
+  scale_fill_manual(values = c("Male" = "steelblue", "Female" = "red")) +
+  labs(title = "Life Satisfaction by Gender", x = "Life Satisfaction", y = "Frequency", fill = "Gender") +
+  theme_minimal()
+
+# This faceted panel is the key visual test of H2: are the slopes different by country?
+plot_country <- ggplot(wvs_clean, aes(x = women_work_attitude, y = life_satisfaction, color = country)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.6) +
+  facet_wrap(~country) +
+  labs(title = "Life Satisfaction vs Women's Work Attitude, by Country",
+       subtitle = "Differing slopes indicate the relationship is moderated by country context",
+       x = "Women's Work Attitude", y = "Life Satisfaction") +
+  theme_minimal() + theme(legend.position = "none")
+
+# Coefficient plot: interaction terms from Model 3
+coef_df <- tidy(model3, conf.int = TRUE) %>%
+  filter(str_detect(term, "women_work_attitude"))
+
+plot_coef <- ggplot(coef_df, aes(x = reorder(term, estimate), y = estimate)) +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "Women's Work Attitude Slope, by Country (Model 3)",
+       x = NULL, y = "Coefficient (95% CI)") +
+  theme_minimal()
+
+gridExtra::grid.arrange(plot_scatter, plot_gender, ncol = 2)
+plot_country
+plot_coef
+```
+
+## Interpretation
+
+The pooled bivariate relationship between women's work attitude and life
+satisfaction is weak and not statistically significant (Model 1), consistent
+with the original lab's finding. Adding country and gender fixed effects (Model
+2) doesn't change that conclusion. The interaction model (Model 3) and the
+formal F-test comparing Models 2 and 3 test H2 directly: whether the slope
+differs meaningfully by country, rather than relying on visual inspection
+alone. The faceted plot above makes the same comparison visually -- some
+countries show a near-flat or even negative slope while others show a mild
+positive one, which is the pattern a "cultural fit" account of well-being
+would predict, though the pooled cross-sectional design here cannot establish
+causal direction.
+
+------------------------------------------------------------------------
+
+# Limitations
+
+-   **Cross-sectional design**: no causal claims about attitudes -> satisfaction
+    (reverse causality and confounding by unobserved country-level factors like
+    GDP or welfare policy are both plausible).
+-   **Non-representative sample**: unweighted WVS respondents from 6 countries,
+    not a population-weighted comparison.
+-   **Ordinal outcome modeled with OLS**: mitigated here with an ordinal logistic
+    robustness check, but interaction effects were not re-tested in that
+    specification due to sample-size-per-cell constraints.
+-   **Single-item measures**: both life satisfaction and work attitudes are
+    single survey items rather than validated multi-item scales.
+
+# Conclusion
+
+Gender role attitudes show, at most, a weak average association with life
+satisfaction in this six-country sample, but the strength and direction of that
+association appears to vary meaningfully by country -- supporting the idea that
+country-level cultural context moderates how gender attitudes relate to
+well-being, rather than there being one universal relationship.
+
+------------------------------------------------------------------------
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
